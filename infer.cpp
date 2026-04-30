@@ -1,18 +1,45 @@
-#include <iostream>
-using namespace std;
+/*
+Model Architecture
 
-struct TCNModel
-{
-    double *hiddenLayers;
-    double *filters;
-    double *biases;
-    int *d;
-    int inChannels;
-    int outChannels;
-    int k;
-    int T;
-    int numBlocks;
-};
+Input: 6 channels
+Layers: 7
+Channels per layer: 16
+Kernel size: 3
+Dilation: 1,2,4,8,16,32,64
+Output: 6 channels (prediction)
+Mode: streaming (latest point only)
+*/
+
+const int inChannels = 6;
+const int layerCount = 7;
+const int cpl = 16;
+const int k = 3;
+const int dilations[layerCount] = {1, 2, 4, 8, 16, 32, 64};
+const int outChannels = 6;
+const int T = 512; // chosen to cover RF = 1 + 2 * (k - 1) * sum(dilations) = 509
+
+double input[inChannels][T];
+double midLayers[layerCount][cpl][T]; // we need this because we do two convolutions
+double hiddenLayers[layerCount][cpl][T];
+
+double inputFilter1[cpl][inChannels][k];
+double inputBias1[cpl];
+
+double inputFilter2[cpl][cpl][k];
+double inputBias2[cpl];
+
+double inputResidualFilter[cpl][inChannels];
+double inputResidualBias[cpl];
+
+double hiddenFilter1[layerCount - 1][cpl][cpl][k];
+double hiddenBias1[layerCount - 1][cpl];
+
+double hiddenFilter2[layerCount - 1][cpl][cpl][k];
+double hiddenBias2[layerCount - 1][cpl];
+
+// no need to cache the output layer since its just inference for the latest point
+double outputFilter[outChannels][cpl];
+double outputBiases[outChannels];
 
 void ReLU(
     double &x // Since we're focused on inference, we only do ReLU on the latest point
@@ -26,10 +53,7 @@ void dilatedConv(
     double *in,     // in - input sequence, format : last entry is the latest entry
     double *kernel, // kernel - filter, format : same as the input, last weight is for latest entry
     double &acc,    // acc - accumulator, pass by reference so we dont have an output. cleaner solution
-    int T,          // T - input sequence length
-    int k,          // k - filter length
-    int d           // d - dilation factor
-)
+    int d)
 {
     for (int i = 0; i < k; i++)
     {
@@ -40,106 +64,148 @@ void dilatedConv(
     }
 }
 
-void doResiBlock(
-    double *in,  // in - input sequence, could be the output of a hidden layer, or the very first layer. depending on channel count is either 1d or 2d
-    double *h1,  // h1 - result of first convolution, can be either 1d or 2d depending on channel count
-    double *b1,  // b1 - this is a 1d array of biases to be added to in for the computation of h1
-    double *k1,  // k1 - this is the filter to be applied to in for the computation of h1
-    double *out, // out - this is the result of the second convolution, can be 1d or 2d
-    double *b2,  // b2 - this is a 1d array of biases to be applied to h1 in order to compute out
-    double *k2,  // k2 - this is the filter to be applied onto h1 in order to compute out
-    double *k3,  // k3,b3 - this is for the residual addition.
-    double *b3,
-    int k,          // k - this is the filter length
-    int d,          // d - this is the dilation factor
-    int T,          // T - this is the length of the input sequence and h1 and out
-    int inChannels, // inChannels - this is the number of input channels (applies to in)
-    int outChannels // outChannels - this is the number of output channels (applies to h1 and out)
-)
+void doInputLayer()
 {
-    // first convolution
     int latest = T - 1;
-    for (int i = 0; i < outChannels; i++)
-    {
-        h1[T * i + latest] = b1[i];
+    int d = dilations[0];
 
-        for (int j = 0; j < inChannels; j++)
-        {
-            dilatedConv(&in[j * T], &k1[(i * inChannels + j) * k], h1[T * i + latest], T, k, d);
-        }
-        ReLU(h1[T * i + latest]);
-    }
-    // second convolution
-    for (int i = 0; i < outChannels; i++)
+    // Conv1: input 6 -> 16
+    for (int oc = 0; oc < cpl; oc++)
     {
-        out[T * i + latest] = b2[i];
-
-        for (int j = 0; j < outChannels; j++)
-        {
-            dilatedConv(&h1[j * T], &k2[(i * outChannels + j) * k], out[T * i + latest], T, k, d);
-        }
-        ReLU(out[T * i + latest]);
-    }
-    // now do the residual add, if in and out channels are the same, k3 is an identity matrix
-    for (int oc = 0; oc < outChannels; oc++)
-    {
-        double res = b3[oc];
+        double acc = inputBias1[oc];
 
         for (int ic = 0; ic < inChannels; ic++)
-        {
-            res += k3[oc * inChannels + ic] * in[ic * T + latest];
-        }
+            dilatedConv(input[ic], inputFilter1[oc][ic], acc, d);
 
-        out[oc * T + latest] += res;
+        ReLU(acc);
+        midLayers[0][oc][latest] = acc;
+    }
+
+    // Conv2: 16 -> 16
+    for (int oc = 0; oc < cpl; oc++)
+    {
+        double acc = inputBias2[oc];
+
+        for (int ic = 0; ic < cpl; ic++)
+            dilatedConv(midLayers[0][ic], inputFilter2[oc][ic], acc, d);
+
+        ReLU(acc);
+
+        // Residual projection: input 6 -> 16
+        double res = inputResidualBias[oc];
+
+        for (int ic = 0; ic < inChannels; ic++)
+            res += inputResidualFilter[oc][ic] * input[ic][latest];
+
+        hiddenLayers[0][oc][latest] = acc + res;
     }
 }
 
-double inferNext // takes relevant data and predicts the next value of the sequence
-    (
-        double *in, // input here comes from the cache and is already sliced to only include relevant history base on dilation
-        TCNModel &model)
+void doHiddenLayer(int layerNum)
 {
-    doResiBlock(in, &model.hiddenLayers[0], &model.biases[0], &model.filters[0],
-                &model.hiddenLayers[model.outChannels * model.T],
-                &model.biases[model.outChannels],
-                &model.filters[model.outChannels * model.inChannels * model.k],
-                &model.filters[(model.outChannels * model.inChannels * model.k) +
-                               (model.outChannels * model.outChannels * model.k)],
-                &model.biases[2 * model.outChannels],
-                model.k, model.d[0], model.T, model.inChannels, model.outChannels);
+    // layerNum goes from 1 to 6
+    int latest = T - 1;
+    int d = dilations[layerNum];
+    int f = layerNum - 1;
 
-    int block0Size =
-        (model.outChannels * model.inChannels * model.k) +
-        (model.outChannels * model.outChannels * model.k) +
-        (model.outChannels * model.inChannels);
-
-    int hiddenBlockSize =
-        (model.outChannels * model.outChannels * model.k) +
-        (model.outChannels * model.outChannels * model.k) +
-        (model.outChannels * model.outChannels);
-
-    for (int i = 1; i < model.numBlocks; i++)
+    // Conv1: 16 -> 16
+    for (int oc = 0; oc < cpl; oc++)
     {
-        doResiBlock(
-            &model.hiddenLayers[(i - 1) * 2 * model.outChannels * model.T + model.outChannels * model.T],
-            &model.hiddenLayers[i * 2 * model.outChannels * model.T],
-            &model.biases[i * 3 * model.outChannels],
-            &model.filters[block0Size + (i - 1) * hiddenBlockSize],
+        double acc = hiddenBias1[f][oc];
 
-            &model.hiddenLayers[i * 2 * model.outChannels * model.T + model.outChannels * model.T],
-            &model.biases[i * 3 * model.outChannels + model.outChannels],
-            &model.filters[block0Size + (i - 1) * hiddenBlockSize +
-                           (model.outChannels * model.outChannels * model.k)],
+        for (int ic = 0; ic < cpl; ic++)
+            dilatedConv(hiddenLayers[layerNum - 1][ic], hiddenFilter1[f][oc][ic], acc, d);
 
-            &model.filters[block0Size + (i - 1) * hiddenBlockSize +
-                           2 * (model.outChannels * model.outChannels * model.k)],
-            &model.biases[i * 3 * model.outChannels + 2 * model.outChannels],
-
-            model.k,
-            model.d[i],
-            model.T,
-            model.outChannels,
-            model.outChannels);
+        ReLU(acc);
+        midLayers[layerNum][oc][latest] = acc;
     }
-    return model.hiddenLayers[model.outChannels * model.numBlocks + model.T - 1];
+
+    // Conv2: 16 -> 16
+    for (int oc = 0; oc < cpl; oc++)
+    {
+        double acc = hiddenBias2[f][oc];
+
+        for (int ic = 0; ic < cpl; ic++)
+            dilatedConv(midLayers[layerNum][ic], hiddenFilter2[f][oc][ic], acc, d);
+
+        ReLU(acc);
+
+        // Identity residual: 16 -> 16
+        hiddenLayers[layerNum][oc][latest] =
+            acc + hiddenLayers[layerNum - 1][oc][latest];
+    }
+}
+
+void doOutputLayer(double output[outChannels])
+{
+    int latest = T - 1;
+
+    for (int oc = 0; oc < outChannels; oc++)
+    {
+        double acc = outputBiases[oc];
+
+        for (int ic = 0; ic < cpl; ic++)
+            acc += outputFilter[oc][ic] * hiddenLayers[layerCount - 1][ic][latest];
+
+        output[oc] = acc;
+    }
+}
+
+// now for some cache handling
+void shiftInput(double newSample[inChannels])
+{
+    for (int ch = 0; ch < inChannels; ch++)
+    {
+        for (int t = 0; t < T - 1; t++)
+            input[ch][t] = input[ch][t + 1];
+
+        input[ch][T - 1] = newSample[ch];
+    }
+}
+
+void shiftHiddenState()
+{
+    for (int layer = 0; layer < layerCount; layer++)
+    {
+        for (int ch = 0; ch < cpl; ch++)
+        {
+            for (int t = 0; t < T - 1; t++)
+            {
+                midLayers[layer][ch][t] = midLayers[layer][ch][t + 1];
+                hiddenLayers[layer][ch][t] = hiddenLayers[layer][ch][t + 1];
+            }
+
+            midLayers[layer][ch][T - 1] = 0.0;
+            hiddenLayers[layer][ch][T - 1] = 0.0;
+        }
+    }
+}
+
+void inferNext(double newSample[inChannels], double prediction[outChannels])
+{
+    // 1. Shift cached input/history state
+    shiftInput(newSample);
+    shiftHiddenState();
+
+    // 2. Compute newest timestep through the TCN
+    doInputLayer();
+
+    for (int layer = 1; layer < layerCount; layer++)
+        doHiddenLayer(layer);
+
+    // 3. Project final hidden state to predicted next IMU sample
+    doOutputLayer(prediction);
+}
+
+double computeError(double prediction[outChannels], double actual[outChannels])
+{
+    double err = 0.0;
+
+    for (int i = 0; i < outChannels; i++)
+    {
+        double diff = actual[i] - prediction[i];
+        err += diff * diff;
+    }
+
+    return err;
 }

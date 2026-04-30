@@ -41,10 +41,10 @@ double hiddenBias2[layerCount - 1][cpl];
 double outputFilter[outChannels][cpl];
 double outputBiases[outChannels];
 
-int head = T - 1; // head starts at 512 so when we incrememnt the first value will be 0
+int head = T - 1; // head starts at 511 so when we incrememnt the first value will be 0
 int samplesSeen = 0;
 
-int rbIndex(int delay)
+int rbIndex(int delay) // ring buffer index
 {
     return (head - delay + T) % T;
 }
@@ -58,7 +58,7 @@ void ReLU(
 }
 
 void dilatedConv(
-    double *in,     // in - input sequence, format : last entry is the latest entry
+    double *in,     // in - input sequence, format : latest sample is at head
     double *kernel, // kernel - filter, format : same as the input, last weight is for latest entry
     double &acc,    // acc - accumulator, pass by reference so we dont have an output. cleaner solution
     int d)
@@ -81,24 +81,23 @@ void doInputLayer()
     // Conv1: input 6 -> 16
     for (int oc = 0; oc < cpl; oc++)
     {
-        double acc = inputBias1[oc];
+        midLayers[0][oc][latest] = inputBias1[oc];
 
         for (int ic = 0; ic < inChannels; ic++)
-            dilatedConv(input[ic], inputFilter1[oc][ic], acc, d);
+            dilatedConv(input[ic], inputFilter1[oc][ic], midLayers[0][oc][latest], d);
 
-        ReLU(acc);
-        midLayers[0][oc][latest] = acc;
+        ReLU(midLayers[0][oc][latest]);
     }
 
     // Conv2: 16 -> 16
     for (int oc = 0; oc < cpl; oc++)
     {
-        double acc = inputBias2[oc];
+        hiddenLayers[0][oc][latest] = inputBias2[oc];
 
         for (int ic = 0; ic < cpl; ic++)
-            dilatedConv(midLayers[0][ic], inputFilter2[oc][ic], acc, d);
+            dilatedConv(midLayers[0][ic], inputFilter2[oc][ic], hiddenLayers[0][oc][latest], d);
 
-        ReLU(acc);
+        ReLU(hiddenLayers[0][oc][latest]);
 
         // Residual projection: input 6 -> 16
         double res = inputResidualBias[oc];
@@ -106,7 +105,7 @@ void doInputLayer()
         for (int ic = 0; ic < inChannels; ic++)
             res += inputResidualFilter[oc][ic] * input[ic][latest];
 
-        hiddenLayers[0][oc][latest] = acc + res;
+        hiddenLayers[0][oc][latest] += res;
     }
 }
 
@@ -120,28 +119,26 @@ void doHiddenLayer(int layerNum)
     // Conv1: 16 -> 16
     for (int oc = 0; oc < cpl; oc++)
     {
-        double acc = hiddenBias1[f][oc];
+        midLayers[layerNum][oc][latest] = hiddenBias1[f][oc];
 
         for (int ic = 0; ic < cpl; ic++)
-            dilatedConv(hiddenLayers[layerNum - 1][ic], hiddenFilter1[f][oc][ic], acc, d);
+            dilatedConv(hiddenLayers[layerNum - 1][ic], hiddenFilter1[f][oc][ic], midLayers[layerNum][oc][latest], d);
 
-        ReLU(acc);
-        midLayers[layerNum][oc][latest] = acc;
+        ReLU(midLayers[layerNum][oc][latest]);
     }
 
     // Conv2: 16 -> 16
     for (int oc = 0; oc < cpl; oc++)
     {
-        double acc = hiddenBias2[f][oc];
+        hiddenLayers[layerNum][oc][latest] = hiddenBias2[f][oc];
 
         for (int ic = 0; ic < cpl; ic++)
-            dilatedConv(midLayers[layerNum][ic], hiddenFilter2[f][oc][ic], acc, d);
+            dilatedConv(midLayers[layerNum][ic], hiddenFilter2[f][oc][ic], hiddenLayers[layerNum][oc][latest], d);
 
-        ReLU(acc);
+        ReLU(hiddenLayers[layerNum][oc][latest]);
 
         // Identity residual: 16 -> 16
-        hiddenLayers[layerNum][oc][latest] =
-            acc + hiddenLayers[layerNum - 1][oc][latest];
+        hiddenLayers[layerNum][oc][latest] += hiddenLayers[layerNum - 1][oc][latest];
     }
 }
 
@@ -151,12 +148,10 @@ void doOutputLayer(double output[outChannels])
 
     for (int oc = 0; oc < outChannels; oc++)
     {
-        double acc = outputBiases[oc];
+        output[oc] = outputBiases[oc];
 
         for (int ic = 0; ic < cpl; ic++)
-            acc += outputFilter[oc][ic] * hiddenLayers[layerCount - 1][ic][latest];
-
-        output[oc] = acc;
+            output[oc] += outputFilter[oc][ic] * hiddenLayers[layerCount - 1][ic][latest];
     }
 }
 
@@ -172,23 +167,10 @@ void shiftInput(double newSample[inChannels])
         input[ch][head] = newSample[ch];
 }
 
-void shiftHiddenState()
-{
-    for (int layer = 0; layer < layerCount; layer++)
-    {
-        for (int ch = 0; ch < cpl; ch++)
-        {
-            midLayers[layer][ch][head] = 0.0;
-            hiddenLayers[layer][ch][head] = 0.0;
-        }
-    }
-}
-
 void inferNext(double newSample[inChannels], double prediction[outChannels])
 {
     // 1. Shift cached input/history state
     shiftInput(newSample);
-    shiftHiddenState();
 
     // 2. Compute newest timestep through the TCN
     doInputLayer();

@@ -41,7 +41,7 @@ double hiddenBias2[layerCount - 1][cpl];
 double outputFilter[outChannels][cpl];
 double outputBiases[outChannels];
 
-int head = 0;
+int head = T - 1; // head starts at 512 so when we incrememnt the first value will be 0
 int samplesSeen = 0;
 
 int rbIndex(int delay)

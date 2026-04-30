@@ -19,7 +19,7 @@ const int outChannels = 6;
 const int T = 512; // chosen to cover RF = 1 + 2 * (k - 1) * sum(dilations) = 509
 
 double input[inChannels][T];
-double midLayers[layerCount][cpl][T]; // we need this because we do two convolutions
+double midLayers[layerCount][cpl][T];
 double hiddenLayers[layerCount][cpl][T];
 
 double inputFilter1[cpl][inChannels][k];
@@ -37,39 +37,38 @@ double hiddenBias1[layerCount - 1][cpl];
 double hiddenFilter2[layerCount - 1][cpl][cpl][k];
 double hiddenBias2[layerCount - 1][cpl];
 
-// no need to cache the output layer since its just inference for the latest point
 double outputFilter[outChannels][cpl];
 double outputBiases[outChannels];
 
-int head = T - 1; // head starts at 511 so when we incrememnt the first value will be 0
+int head = T - 1;
 int samplesSeen = 0;
 
-int rbIndex(int delay) // ring buffer index
-{
-    return (head - delay + T) % T;
-}
-
-void ReLU(
-    double &x // Since we're focused on inference, we only do ReLU on the latest point
-)
+void ReLU(double &x)
 {
     if (x < 0)
         x = 0;
 }
 
-void dilatedConv(
-    double *in,     // in - input sequence, format : latest sample is at head
-    double *kernel, // kernel - filter, format : same as the input, last weight is for latest entry
-    double &acc,    // acc - accumulator, pass by reference so we dont have an output. cleaner solution
-    int d)
+void buildIdx(int idx[k], int d)
 {
     for (int i = 0; i < k; i++)
     {
         int delay = d * i;
+        idx[i] = (delay < samplesSeen) ? (head - delay + T) & (T - 1) : -1; // bitmask wrap around works since 512 is a power of 2
+    }
+}
 
-        if (delay >= samplesSeen)
-            break;                                     // zero padding for when we go beyond the size of the sequnce
-        acc += kernel[k - 1 - i] * in[rbIndex(delay)]; // this skips every point according to the dilation factor
+void dilatedConv(
+    double *in,
+    double *kernel,
+    double &acc,
+    const int idx[k])
+{
+    for (int i = 0; i < k; i++)
+    {
+        if (idx[i] < 0)
+            break;
+        acc += kernel[k - 1 - i] * in[idx[i]];
     }
 }
 
@@ -78,13 +77,16 @@ void doInputLayer()
     int latest = head;
     int d = dilations[0];
 
+    int idx[k];
+    buildIdx(idx, d);
+
     // Conv1: input 6 -> 16
     for (int oc = 0; oc < cpl; oc++)
     {
         midLayers[0][oc][latest] = inputBias1[oc];
 
         for (int ic = 0; ic < inChannels; ic++)
-            dilatedConv(input[ic], inputFilter1[oc][ic], midLayers[0][oc][latest], d);
+            dilatedConv(input[ic], inputFilter1[oc][ic], midLayers[0][oc][latest], idx);
 
         ReLU(midLayers[0][oc][latest]);
     }
@@ -95,7 +97,7 @@ void doInputLayer()
         hiddenLayers[0][oc][latest] = inputBias2[oc];
 
         for (int ic = 0; ic < cpl; ic++)
-            dilatedConv(midLayers[0][ic], inputFilter2[oc][ic], hiddenLayers[0][oc][latest], d);
+            dilatedConv(midLayers[0][ic], inputFilter2[oc][ic], hiddenLayers[0][oc][latest], idx);
 
         ReLU(hiddenLayers[0][oc][latest]);
 
@@ -111,10 +113,12 @@ void doInputLayer()
 
 void doHiddenLayer(int layerNum)
 {
-    // layerNum goes from 1 to 6
     int latest = head;
     int d = dilations[layerNum];
     int f = layerNum - 1;
+
+    int idx[k];
+    buildIdx(idx, d);
 
     // Conv1: 16 -> 16
     for (int oc = 0; oc < cpl; oc++)
@@ -122,7 +126,7 @@ void doHiddenLayer(int layerNum)
         midLayers[layerNum][oc][latest] = hiddenBias1[f][oc];
 
         for (int ic = 0; ic < cpl; ic++)
-            dilatedConv(hiddenLayers[layerNum - 1][ic], hiddenFilter1[f][oc][ic], midLayers[layerNum][oc][latest], d);
+            dilatedConv(hiddenLayers[layerNum - 1][ic], hiddenFilter1[f][oc][ic], midLayers[layerNum][oc][latest], idx);
 
         ReLU(midLayers[layerNum][oc][latest]);
     }
@@ -133,7 +137,7 @@ void doHiddenLayer(int layerNum)
         hiddenLayers[layerNum][oc][latest] = hiddenBias2[f][oc];
 
         for (int ic = 0; ic < cpl; ic++)
-            dilatedConv(midLayers[layerNum][ic], hiddenFilter2[f][oc][ic], hiddenLayers[layerNum][oc][latest], d);
+            dilatedConv(midLayers[layerNum][ic], hiddenFilter2[f][oc][ic], hiddenLayers[layerNum][oc][latest], idx);
 
         ReLU(hiddenLayers[layerNum][oc][latest]);
 
@@ -155,10 +159,9 @@ void doOutputLayer(double output[outChannels])
     }
 }
 
-// now for some cache handling
 void shiftInput(double newSample[inChannels])
 {
-    head = (head + 1) % T;
+    head = (head + 1) & (T - 1);
 
     if (samplesSeen < T)
         samplesSeen++;
@@ -169,16 +172,12 @@ void shiftInput(double newSample[inChannels])
 
 void inferNext(double newSample[inChannels], double prediction[outChannels])
 {
-    // 1. Shift cached input/history state
     shiftInput(newSample);
-
-    // 2. Compute newest timestep through the TCN
     doInputLayer();
 
     for (int layer = 1; layer < layerCount; layer++)
         doHiddenLayer(layer);
 
-    // 3. Project final hidden state to predicted next IMU sample
     doOutputLayer(prediction);
 }
 

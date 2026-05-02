@@ -32,21 +32,26 @@ def receptive_field():
 # Dataset
 # =========================
 
-class IMUDataset(torch.utils.data.Dataset):
-    def __init__(self, data):
-        self.data = data.astype(np.float32)
+class MultiFileIMUDataset(torch.utils.data.Dataset):
+    def __init__(self, arrays):
+        self.arrays = [a.astype(np.float32) for a in arrays]
+        self.index = []
+
+        for file_idx, data in enumerate(self.arrays):
+            n = len(data) - T
+            for start_idx in range(n):
+                self.index.append((file_idx, start_idx))
 
     def __len__(self):
-        return len(self.data) - T
+        return len(self.index)
 
     def __getitem__(self, idx):
-        # samples t-511 through t
-        x = self.data[idx : idx + T]
+        file_idx, start_idx = self.index[idx]
+        data = self.arrays[file_idx]
 
-        # next sample t+1
-        y = self.data[idx + T]
+        x = data[start_idx : start_idx + T]
+        y = data[start_idx + T]
 
-        # Conv1D expects [channels, time]
         return torch.tensor(x.T), torch.tensor(y)
 
 
@@ -186,25 +191,35 @@ def export_for_cpp(model, mean, std, path):
 # Training
 # =========================
 
+def load_imu_csv(path):
+    df = pd.read_csv(path, header=None)
+
+    # directly select by column index
+    data = df.iloc[:, [10, 11, 12, 4, 5, 6]].values.astype(np.float32)
+
+    return data
+
+
 def train(args):
-    df = pd.read_csv(args.csv)
 
-    cols = ["ax", "ay", "az", "gx", "gy", "gz"]
-    data = df[cols].values.astype(np.float32)
+    arrays = [load_imu_csv(path) for path in args.csv]
 
-    mean = data.mean(axis=0)
-    std = data.std(axis=0) + 1e-8
-    data = (data - mean) / std
+    all_data = np.concatenate(arrays, axis=0)
+    mean = all_data.mean(axis=0)
+    std = all_data.std(axis=0) + 1e-8
+
+    arrays = [(a - mean) / std for a in arrays]
 
     rf = receptive_field()
     print(f"Receptive field: {rf} samples")
 
-    split = int(len(data) * 0.8)
-    train_data = data[:split]
-    val_data = data[split - T:]
+    split = int(len(arrays) * 0.8)
 
-    train_set = IMUDataset(train_data)
-    val_set = IMUDataset(val_data)
+    train_arrays = arrays[:split]
+    val_arrays = arrays[split:]
+
+    train_set = MultiFileIMUDataset(train_arrays)
+    val_set = MultiFileIMUDataset(val_arrays)
 
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False)
@@ -214,6 +229,9 @@ def train(args):
     loss_fn = nn.MSELoss()
 
     best_val = math.inf
+
+    patience = 8
+    bad_epochs = 0
 
     for epoch in range(args.epochs):
         model.train()
@@ -253,7 +271,14 @@ def train(args):
 
         if val_loss < best_val:
             best_val = val_loss
+            bad_epochs = 0
             torch.save(model.state_dict(), args.model_out)
+        else:
+            bad_epochs += 1
+
+        if bad_epochs >= patience:
+            print(f"Early stopping at epoch {epoch+1}")
+            break
 
     print(f"Best validation MSE: {best_val:.6f}")
 
@@ -289,7 +314,10 @@ def plot_validation(model, val_set, mean, std, plot_path):
     preds_denorm = preds * std + mean
     actuals_denorm = actuals * std + mean
 
-    labels = ["ax", "ay", "az", "gx", "gy", "gz"]
+    labels = [
+        "user_acc_x(G)", "user_acc_y(G)", "user_acc_z(G)",
+        "rotation_rate_x(radians_s)", "rotation_rate_y(radians_s)", "rotation_rate_z(radians_s)"
+    ]
 
     for ch in range(6):
         plt.figure()
@@ -324,7 +352,7 @@ def plot_validation(model, val_set, mean, std, plot_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--csv", required=True)
+    parser.add_argument("--csv", required=True, nargs="+")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)

@@ -9,6 +9,17 @@ Dilation: 1,2,4,8,16,32,64
 Output: 6 channels (prediction)
 Mode: streaming (latest point only)
 */
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <array>
+#include <string>
+#include <iomanip>
+#include "nlohmann/json.hpp"
+
+using namespace std;
+using json = nlohmann::json;
 
 const int inChannels = 6;
 const int layerCount = 7;
@@ -17,6 +28,9 @@ const int k = 3;
 const int dilations[layerCount] = {1, 2, 4, 8, 16, 32, 64};
 const int outChannels = 6;
 const int T = 512; // chosen to cover RF = 1 + 2 * (k - 1) * sum(dilations) = 509
+
+double meanVals[inChannels];
+double stdVals[inChannels];
 
 double input[inChannels][T];
 double midLayers[layerCount][cpl][T];
@@ -192,4 +206,98 @@ double computeError(double prediction[outChannels], double actual[outChannels])
     }
 
     return err;
+}
+
+// the inference math stops here, the following is for weight loading and running the inference
+
+void loadWeights(const string& path)
+{
+    ifstream f(path);
+    json j;
+    f >> j;
+
+    for (int i = 0; i < inChannels; i++) {
+        meanVals[i] = j["mean"][i];
+        stdVals[i] = j["std"][i];
+    }
+
+    for (int oc = 0; oc < cpl; oc++) {
+        inputBias1[oc] = j["inputBias1"][oc];
+        inputBias2[oc] = j["inputBias2"][oc];
+        inputResidualBias[oc] = j["inputResidualBias"][oc];
+
+        for (int ic = 0; ic < inChannels; ic++) {
+            inputResidualFilter[oc][ic] = j["inputResidualFilter"][oc][ic];
+            for (int kk = 0; kk < k; kk++)
+                inputFilter1[oc][ic][kk] = j["inputFilter1"][oc][ic][kk];
+        }
+
+        for (int ic = 0; ic < cpl; ic++)
+            for (int kk = 0; kk < k; kk++)
+                inputFilter2[oc][ic][kk] = j["inputFilter2"][oc][ic][kk];
+    }
+
+    for (int l = 0; l < layerCount - 1; l++)
+        for (int oc = 0; oc < cpl; oc++) {
+            hiddenBias1[l][oc] = j["hiddenBias1"][l][oc];
+            hiddenBias2[l][oc] = j["hiddenBias2"][l][oc];
+
+            for (int ic = 0; ic < cpl; ic++)
+                for (int kk = 0; kk < k; kk++) {
+                    hiddenFilter1[l][oc][ic][kk] = j["hiddenFilter1"][l][oc][ic][kk];
+                    hiddenFilter2[l][oc][ic][kk] = j["hiddenFilter2"][l][oc][ic][kk];
+                }
+        }
+
+    for (int oc = 0; oc < outChannels; oc++) {
+        outputBiases[oc] = j["outputBiases"][oc];
+        for (int ic = 0; ic < cpl; ic++)
+            outputFilter[oc][ic] = j["outputFilter"][oc][ic];
+    }
+}
+
+int main(int argc, char* argv[])
+{
+    loadWeights(argv[2]);
+
+    ifstream in(argv[1]);
+    ofstream out(argv[3]);
+
+    out << "sample,pred0,pred1,pred2,pred3,pred4,pred5\n";
+    out << fixed << setprecision(10);
+
+    string line;
+    int sample = 0;
+
+    while (getline(in, line)) {
+        stringstream ss(line);
+        string cell;
+        vector<double> c;
+
+        while (getline(ss, cell, ','))
+            c.push_back(stod(cell));
+
+        double x[inChannels] = {
+            (c[10] - meanVals[0]) / stdVals[0],
+            (c[11] - meanVals[1]) / stdVals[1],
+            (c[12] - meanVals[2]) / stdVals[2],
+            (c[4]  - meanVals[3]) / stdVals[3],
+            (c[5]  - meanVals[4]) / stdVals[4],
+            (c[6]  - meanVals[5]) / stdVals[5]
+        };
+
+        double pred[outChannels];
+        inferNext(x, pred);
+
+        if (sample >= T) {
+            out << sample;
+            for (int ch = 0; ch < outChannels; ch++)
+                out << "," << pred[ch];
+            out << "\n";
+        }
+
+        sample++;
+    }
+
+    return 0;
 }

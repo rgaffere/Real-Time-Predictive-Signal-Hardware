@@ -9,7 +9,7 @@ Stage 2: Write the inference engine in cpp (this is also stage 1 part 2 since it
 
 Stage 3: train a model with pytorch (done)
 
-Stage 4: see if inference engine is correct, and show results (almost done, working on paper but validation work is done)
+Stage 4: see if inference engine is correct, and show results (done)
 
 Stage 5: hardware
 
